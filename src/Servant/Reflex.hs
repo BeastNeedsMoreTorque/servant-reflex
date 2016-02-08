@@ -8,6 +8,7 @@
 {-# LANGUAGE TypeFamilies         #-}
 {-# LANGUAGE TypeOperators        #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
 #if !MIN_VERSION_base(4,8,0)
 {-# LANGUAGE OverlappingInstances #-}
@@ -60,29 +61,26 @@ import Reflex.Dom.Xhr
 -- > postNewBook :: Book -> ExceptT String IO Book
 -- > (getAllBooks :<|> postNewBook) = client myApi host
 -- >   where host = BaseUrl Http "localhost" 8080
-client :: HasReflexClient layout
-       => Proxy layout
+client :: forall t m layout .MonadWidget t m => HasReflexClient t m layout
+       => Proxy t
+       -> Proxy m
+       -> Proxy layout
        -> BaseUrl
-       -> Client (Input layout) (Output layout)
-client p baseurl = clientWithRoute p defReq baseurl
+       -> Client t m layout
+client t m l baseurl = clientWithRoute t m l defReq baseurl
 
 data a ::> b = a ::> b deriving (Eq,Ord,Show,Read)
 
 infixr 3 ::>
 
-type Client ins outs = MonadWidget t m => Event t ins -> m (Event t (ins,outs))
+-- type Client ins outs = MonadWidget t m => Event t ins -> m (Event t (ins,outs))
 
 -- | This class lets us define how each API combinator
 -- influences the creation of an HTTP request. It's mostly
 -- an internal class, you can just use 'client'.
-class HasReflexClient layout where
-  type Input layout :: *
-  type Output layout :: *
-  -- clientWithRoute :: MonadWidget t m => Proxy layout -> Req -> BaseUrl
-  --                 -> Event t (Input layout) -> m (Event t (Input layout, Output layout))
-  clientWithRoute :: MonadWidget t m 
-                  => Proxy layout -> Req -> BaseUrl 
-                  -> Event t (Input layout) -> m (Event t (Input layout, Output layout))
+class MonadWidget t m => HasReflexClient t (m :: * -> *) layout where
+  type Client t m layout :: *
+  clientWithRoute :: Proxy t -> Proxy m -> Proxy layout -> Req -> BaseUrl -> Client t m layout
 
 
 -- | If you have a 'Get' endpoint in your API, the client
@@ -93,11 +91,12 @@ instance
 #if MIN_VERSION_base(4,8,0)
          {-# OVERLAPPABLE #-}
 #endif
-  (MimeUnrender ct result) => HasReflexClient (Get (ct ': cts) result) where
-  type Input (Get (ct ': cts) result) = ()
-  type Output (Get (ct ': cts) result) = result
-  -- type Client (Get (ct ': cts) result) = MonadWidget t m => Event t (Input layout) -> m (Event t result)
-  clientWithRoute Proxy req baseurl trigEvents = undefined -- performAJAX requestBuilder responseParser
+  (MonadWidget t m, MimeUnrender ct result) => HasReflexClient t m (Get (ct ': cts) result) where
+  -- type Client t m layout = Event t () -> m (Event t result)
+  -- type Input (Get (ct ': cts) result) = ()
+  -- type Output (Get (ct ': cts) result) = result
+  type Client t m (Get (ct ': cts) result) = Event t () -> m (Event t ((),result))
+  clientWithRoute Proxy Proxy Proxy req baseurl trigEvents = undefined -- performAJAX requestBuilder responseParser
 --     where
 --       requestBuilder _ = XhrRequest "GET" (showBaseUrl baseurl) def
 --       responseParser xhrResp = undefined
@@ -121,11 +120,11 @@ instance
 #if MIN_VERSION_base(4,8,0)
          {-# OVERLAPPING #-}
 #endif
-  HasReflexClient (Get (ct ': cts) ()) where
-  type Input (Get (ct ': cts) ()) = ()
-  type Output (Get (ct ': cts) ()) = ()
-  -- type Client (Get (ct ': cts) ()) = MonadWidget t m => Event t () -> m (Event t ())
-  clientWithRoute Proxy req baseurl trigEvents =
+  MonadWidget t m => HasReflexClient t m (Get (ct ': cts) ()) where
+  -- type Input (Get (ct ': cts) ()) = ()
+  -- type Output (Get (ct ': cts) ()) = ()
+  type Client t m (Get (ct ': cts) ()) = Event t () -> m (Event t ((),()))
+  clientWithRoute Proxy Proxy Proxy req baseurl trigEvents =
     performAJAX requestBuilder responseParser trigEvents
     where
       requestBuilder _ = XhrRequest "GET" (showBaseUrl baseurl) def
@@ -171,12 +170,13 @@ instance
 -- > postNewBook :: Book -> ExceptT String IO Book
 -- > (getAllBooks :<|> postNewBook) = client myApi host
 -- >   where host = BaseUrl Http "localhost" 8080
-instance (HasReflexClient a, HasReflexClient b) => HasReflexClient (a :<|> b) where
-  type Input (a :<|> b) = Input a :<|> Input b
-  type Output (a :<|> b) = Output a :<|> Output b
-  clientWithRoute Proxy req baseurl (a :<|> b) = undefined
---    clientWithRoute (Proxy :: Proxy a) req baseurl a :<|>
---    clientWithRoute (Proxy :: Proxy b) req baseurl b
+instance (MonadWidget t m, HasReflexClient t m a, HasReflexClient t m b) => HasReflexClient t m (a :<|> b) where
+  -- type Input (a :<|> b) = Input a :<|> Input b
+  -- type Output (a :<|> b) = Output a :<|> Output b
+  type Client t m (a :<|> b) = Client t m a :<|> Client t m b
+  clientWithRoute t m (Proxy :: Proxy (a :<|> b)) req baseurl = --  (a :<|> b) =
+    clientWithRoute t m (Proxy :: Proxy a) req baseurl :<|>
+    clientWithRoute t m (Proxy :: Proxy b) req baseurl
 
 -- ------------------------------------------------------------------------------
 -- -- | If you use a 'Capture' in one of your endpoints in your API,
@@ -578,13 +578,14 @@ instance (HasReflexClient a, HasReflexClient b) => HasReflexClient (a :<|> b) wh
 --                     baseurl rest
 --
 -- | Make the querying function append @path@ to the request path.
-instance (KnownSymbol path, HasReflexClient sublayout) => HasReflexClient (path :> sublayout) where
-  type Input (path :> sublayout) = Input sublayout
-  type Output (path :> sublayout) = Output sublayout
-  clientWithRoute Proxy req baseurl val =
-     clientWithRoute (Proxy :: Proxy sublayout)
+instance (MonadWidget t m, KnownSymbol path, HasReflexClient t m sublayout) => HasReflexClient t m (path :> sublayout) where
+  -- type Input (path :> sublayout) = Input sublayout
+  -- type Output (path :> sublayout) = Output sublayout
+  type Client t m (path :> sublayout) = Client t m sublayout
+  clientWithRoute t m layout req baseurl =
+     clientWithRoute t m (Proxy :: Proxy sublayout)
                      (appendToPath p req)
-                     baseurl val
+                     baseurl
 
     where p = symbolVal (Proxy :: Proxy path)
 
